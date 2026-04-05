@@ -1,1 +1,168 @@
-# CronWorkflow Argo — retraining périodique du modèle
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: fraud-retrain-cron
+  namespace: fraud-detect
+spec:
+  # Retraining hebdomadaire — tous les lundis à 02h00
+  schedule: "0 2 * * 1"
+  timezone: "Europe/Paris"
+  concurrencyPolicy: Forbid       # Ne pas lancer si un run est déjà en cours
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+
+  workflowSpec:
+    entrypoint: retrain-pipeline
+    serviceAccountName: argo-workflow-sa
+
+    arguments:
+      parameters:
+        - name: data-path
+          value: /data/transactions.csv
+        - name: model-name
+          value: fraud-detector
+        - name: max-epochs
+          value: "50"
+        - name: f1-promotion-threshold
+          value: "0.80"
+        - name: image-model
+          value: fraud-detect/model:latest
+
+    templates:
+      - name: retrain-pipeline
+        steps:
+          # Étape 0 : export des nouvelles transactions depuis pgvector vers CSV
+          - - name: export-data
+              template: export-step
+
+          # Étape 1 : entraînement
+          - - name: train
+              template: train-step
+
+          # Étape 2 : évaluation + promotion conditionnelle
+          - - name: evaluate
+              template: eval-step
+              arguments:
+                parameters:
+                  - name: run-id
+                    value: "{{steps.train.outputs.parameters.run-id}}"
+
+          # Étape 3 : redémarrage du serving si éval OK
+          - - name: deploy
+              template: deploy-step
+              when: "{{steps.evaluate.status}} == Succeeded"
+
+      # -------------------------------------------------------------------
+      # Export pgvector → CSV (nouvelles transactions étiquetées)
+      # -------------------------------------------------------------------
+      - name: export-step
+        container:
+          image: "{{workflow.parameters.image-model}}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "core.data.pgvector.export"]
+          env:
+            - name: PGVECTOR_HOST
+              value: pgvector
+            - name: PGVECTOR_DB
+              value: fraud
+            - name: PGVECTOR_USER
+              valueFrom:
+                secretKeyRef:
+                  name: pgvector-secret
+                  key: username
+            - name: PGVECTOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pgvector-secret
+                  key: password
+            - name: OUTPUT_PATH
+              value: /data/transactions.csv
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+
+      # -------------------------------------------------------------------
+      # Entraînement
+      # -------------------------------------------------------------------
+      - name: train-step
+        outputs:
+          parameters:
+            - name: run-id
+              valueFrom:
+                path: /tmp/run_id.txt
+        container:
+          image: "{{workflow.parameters.image-model}}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "core.model.train"]
+          env:
+            - name: DATA_PATH
+              value: "{{workflow.parameters.data-path}}"
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow:5000
+            - name: MODEL_NAME
+              value: "{{workflow.parameters.model-name}}"
+            - name: MAX_EPOCHS
+              value: "{{workflow.parameters.max-epochs}}"
+            - name: RUN_ID_OUTPUT_PATH
+              value: /tmp/run_id.txt
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: "2"
+            limits:
+              memory: 4Gi
+              cpu: "4"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+
+      # -------------------------------------------------------------------
+      # Évaluation
+      # -------------------------------------------------------------------
+      - name: eval-step
+        inputs:
+          parameters:
+            - name: run-id
+        container:
+          image: "{{workflow.parameters.image-model}}"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "core.model.eval"]
+          env:
+            - name: DATA_PATH
+              value: "{{workflow.parameters.data-path}}"
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow:5000
+            - name: MODEL_NAME
+              value: "{{workflow.parameters.model-name}}"
+            - name: RUN_ID
+              value: "{{inputs.parameters.run-id}}"
+            - name: F1_PROMOTION_THRESHOLD
+              value: "{{workflow.parameters.f1-promotion-threshold}}"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+
+      # -------------------------------------------------------------------
+      # Deploy
+      # -------------------------------------------------------------------
+      - name: deploy-step
+        resource:
+          action: patch
+          mergeStrategy: merge
+          manifest: |
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: fraud-serving
+              namespace: fraud-detect
+            spec:
+              template:
+                metadata:
+                  annotations:
+                    kubectl.kubernetes.io/restartedAt: "{{workflow.creationTimestamp}}"
+
+    volumes:
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: fraud-data-pvc

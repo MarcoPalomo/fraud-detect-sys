@@ -124,11 +124,14 @@ def main():
             pickle.dump(scaler, f)
             mlflow.log_artifact(f.name, artifact_path="scaler")
 
-        logger.info(
-            "Run %s terminé — modèle '%s' enregistré dans MLflow Registry",
-            run.info.run_id,
-            model_name,
-        )
+        run_id = run.info.run_id
+        logger.info("Run %s terminé — modèle '%s' enregistré dans MLflow Registry", run_id, model_name)
+
+        # Écriture du run_id dans un fichier pour Argo (outputs.parameters)
+        run_id_path = os.environ.get("RUN_ID_OUTPUT_PATH", "/tmp/run_id.txt")
+        with open(run_id_path, "w") as f:
+            f.write(run_id)
+        logger.info("run_id écrit dans %s", run_id_path)
 
 
 if __name__ == "__main__":

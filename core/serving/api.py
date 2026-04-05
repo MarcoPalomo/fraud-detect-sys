@@ -10,26 +10,18 @@ import psycopg2
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from prometheus_client import make_asgi_app
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from prometheus_client import Counter, Histogram, make_asgi_app
+from core.observability.otel import setup_tracing, get_tracer
+from core.observability.metrics import (
+    REQUEST_COUNT,
+    REQUEST_LATENCY,
+    FRAUD_SCORE,
+    MODEL_VERSION,
+    EMBEDDING_STORE_ERRORS,
+)
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Métriques Prometheus
-# ---------------------------------------------------------------------------
-REQUEST_COUNT = Counter(
-    "fraud_requests_total", "Nombre total de requêtes de scoring", ["result"]
-)
-REQUEST_LATENCY = Histogram(
-    "fraud_request_latency_seconds", "Latence du scoring (secondes)"
-)
-FRAUD_SCORE = Histogram(
-    "fraud_score_distribution", "Distribution des scores de risque", buckets=[0.1 * i for i in range(11)]
-)
 
 # ---------------------------------------------------------------------------
 # Modèle global (chargé au démarrage)
@@ -49,19 +41,13 @@ def load_model_from_registry() -> None:
     model_state["model"] = mlflow.pytorch.load_model(f"models:/fraud-detector/Production")
     model_state["model"].eval()
     model_state["version"] = mv.version
+    MODEL_VERSION.set(int(mv.version))
     logger.info("Modèle fraud-detector v%s chargé depuis MLflow", mv.version)
-
-
-def setup_otel() -> None:
-    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
-    provider = TracerProvider()
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
-    trace.set_tracer_provider(provider)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    setup_otel()
+    setup_tracing(app=app)
     load_model_from_registry()
     yield
     logger.info("Shutdown — libération des ressources")
@@ -188,9 +174,12 @@ def predict(tx: Transaction):
         span.set_attribute("fraud.risk_score", risk_score)
         span.set_attribute("fraud.is_fraud", is_fraud)
 
-        # Stockage embedding async (best-effort)
-        embedding = tensor.squeeze().tolist()
-        store_embedding(tx.transaction_id, embedding)
+        # Stockage embedding (best-effort)
+        try:
+            embedding = tensor.squeeze().tolist()
+            store_embedding(tx.transaction_id, embedding)
+        except Exception:
+            EMBEDDING_STORE_ERRORS.inc()
 
         return PredictionResponse(
             transaction_id=tx.transaction_id,

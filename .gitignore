@@ -1,10 +1,41 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.venv/
 .env
 *.pem
 *.key
-# Ne jamais committer les secrets K8s en clair
+dist/
+build/
+
+# Secrets K8s — ne jamais committer
 k8s/pgvector/secret.yaml
+argo/events/secret.yaml
+argo/cd/cd-pipeline.yaml
+
+# MLflow
 mlruns/
+mlartifacts/
+
+# Données brutes — potentiellement PII
+data/raw/
+*.csv
+
+# Modèles entraînés
+*.ckpt
+*.pt
+*.pkl
+
+# Coverage / tests
+.coverage
+coverage.xml
+junit.xml
+htmlcov/
+.pytest_cache/
+
+# Editors
 .DS_Store
+.idea/
+.vscode/
+*.swp

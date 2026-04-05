@@ -1,0 +1,41 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: gitlab-cd-sensor
+  namespace: fraud-detect
+spec:
+  template:
+    serviceAccountName: argo-workflow-sa
+
+  dependencies:
+    - name: gitlab-push
+      eventSourceName: gitlab-webhook
+      eventName: fraud-gitlab-push
+
+  triggers:
+    - template:
+        name: trigger-cd-pipeline
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: fraud-cd-
+                namespace: fraud-detect
+              spec:
+                workflowTemplateRef:
+                  name: fraud-cd-pipeline
+                # Injection des paramètres depuis le payload GitLab
+                arguments:
+                  parameters:
+                    - name: image-model
+                      value: "{{ .Input.body.image_model }}"
+                    - name: image-serving
+                      value: "{{ .Input.body.image_serving }}"
+                    - name: commit-sha
+                      value: "{{ .Input.body.commit_sha }}"
+      retryStrategy:
+        steps: 3
+        duration: 10s

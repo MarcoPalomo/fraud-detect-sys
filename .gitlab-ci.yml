@@ -1,0 +1,229 @@
+---
+# =============================================================================
+# GitLab CI — fraud-detect-sys
+#
+# Stages :
+#   lint    → ruff (style/format) + mypy (types)
+#   scan    → bandit (SAST Python) + trivy (image CVE)
+#   test    → pytest + coverage
+#   build   → docker build + push vers le registry GitLab
+#   trigger → webhook vers Argo Events pour déclencher le CD (trunk only)
+# =============================================================================
+
+default:
+  image: python:3.11-slim
+  interruptible: true
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  REGISTRY: "$CI_REGISTRY_IMAGE"
+  IMAGE_MODEL:   "$CI_REGISTRY_IMAGE/model:$CI_COMMIT_SHORT_SHA"
+  IMAGE_SERVING: "$CI_REGISTRY_IMAGE/serving:$CI_COMMIT_SHORT_SHA"
+  IMAGE_MODEL_LATEST:   "$CI_REGISTRY_IMAGE/model:latest"
+  IMAGE_SERVING_LATEST: "$CI_REGISTRY_IMAGE/serving:latest"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .pip-cache/
+
+stages:
+  - lint
+  - scan
+  - test
+  - build
+  - trigger
+
+# =============================================================================
+# LINT
+# =============================================================================
+ruff:
+  stage: lint
+  before_script:
+    - pip install --quiet ruff==0.4.4
+  script:
+    - ruff check core/ --output-format=gitlab
+    - ruff format core/ --check
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+
+mypy:
+  stage: lint
+  before_script:
+    - pip install --quiet mypy==1.10.0 types-psycopg2
+    - pip install --quiet -r requirements.serving.txt -r requirements.model.txt
+  script:
+    - mypy core/ --ignore-missing-imports --strict-optional
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+
+# =============================================================================
+# SCAN
+# =============================================================================
+bandit:
+  stage: scan
+  before_script:
+    - pip install --quiet bandit[toml]==1.7.8
+  script:
+    - bandit -r core/ -ll -f json -o bandit-report.json || true
+    # Echec si sévérité HIGH ou CRITICAL
+    - bandit -r core/ -lll
+  artifacts:
+    when: always
+    paths:
+      - bandit-report.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+
+trivy-model:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [build-model]
+  script:
+    - trivy image
+        --exit-code 1
+        --severity HIGH,CRITICAL
+        --format template
+        --template "@/contrib/gitlab.tpl"
+        --output trivy-model-report.json
+        "$IMAGE_MODEL"
+  artifacts:
+    reports:
+      container_scanning: trivy-model-report.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+
+trivy-serving:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [build-serving]
+  script:
+    - trivy image
+        --exit-code 1
+        --severity HIGH,CRITICAL
+        --format template
+        --template "@/contrib/gitlab.tpl"
+        --output trivy-serving-report.json
+        "$IMAGE_SERVING"
+  artifacts:
+    reports:
+      container_scanning: trivy-serving-report.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+
+# =============================================================================
+# TEST
+# =============================================================================
+pytest:
+  stage: test
+  before_script:
+    - pip install --quiet pytest pytest-cov pytest-asyncio httpx
+    - pip install --quiet -r requirements.serving.txt -r requirements.model.txt
+  script:
+    - pytest tests/
+        --cov=core
+        --cov-report=term-missing
+        --cov-report=xml:coverage.xml
+        --junitxml=junit.xml
+        -v
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+
+# =============================================================================
+# BUILD
+# =============================================================================
+.build-base:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+
+build-model:
+  extends: .build-base
+  script:
+    - docker build
+        -f docker/Dockerfile.model
+        -t "$IMAGE_MODEL"
+        -t "$IMAGE_MODEL_LATEST"
+        .
+    - docker push "$IMAGE_MODEL"
+    - docker push "$IMAGE_MODEL_LATEST"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+      changes:
+        - core/model/**/*
+        - core/data/**/*
+        - docker/Dockerfile.model
+        - requirements.model.txt
+
+build-serving:
+  extends: .build-base
+  script:
+    - docker build
+        -f docker/Dockerfile.serving
+        -t "$IMAGE_SERVING"
+        -t "$IMAGE_SERVING_LATEST"
+        .
+    - docker push "$IMAGE_SERVING"
+    - docker push "$IMAGE_SERVING_LATEST"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+      changes:
+        - core/serving/**/*
+        - core/observability/**/*
+        - docker/Dockerfile.serving
+        - requirements.serving.txt
+
+# =============================================================================
+# TRIGGER ARGO CD (trunk only, après build)
+# =============================================================================
+trigger-argo-cd:
+  stage: trigger
+  image: curlimages/curl:latest
+  needs:
+    - job: build-model
+      optional: true
+    - job: build-serving
+      optional: true
+    - pytest
+  script:
+    - |
+      curl -f -X POST \
+        "${ARGO_EVENTS_WEBHOOK_URL}/fraud-gitlab-push" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${ARGO_EVENTS_TOKEN}" \
+        -d "{
+          \"commit_sha\":    \"${CI_COMMIT_SHORT_SHA}\",
+          \"branch\":        \"${CI_COMMIT_BRANCH}\",
+          \"image_model\":   \"${IMAGE_MODEL}\",
+          \"image_serving\": \"${IMAGE_SERVING}\",
+          \"pipeline_url\":  \"${CI_PIPELINE_URL}\"
+        }"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "trunk"'
+  environment:
+    name: production

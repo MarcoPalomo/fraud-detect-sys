@@ -1,0 +1,195 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: fraud-cd-pipeline
+  namespace: fraud-detect
+spec:
+  entrypoint: cd-pipeline
+  serviceAccountName: argo-workflow-sa
+
+  arguments:
+    parameters:
+      - name: image-model
+        value: fraud-detect/model:latest
+      - name: image-serving
+        value: fraud-detect/serving:latest
+      - name: commit-sha
+        value: "local"
+      - name: data-raw-path
+        value: /data/raw/transactions.csv
+      - name: data-anon-path
+        value: /data/anon/transactions.csv
+      - name: model-name
+        value: fraud-detector
+      - name: f1-promotion-threshold
+        value: "0.80"
+
+  templates:
+    # -------------------------------------------------------------------------
+    # DAG principal
+    # -------------------------------------------------------------------------
+    - name: cd-pipeline
+      dag:
+        tasks:
+          # Étape 1 : anonymisation des données brutes
+          - name: anonymize
+            template: anonymize-step
+
+          # Étape 2 : entraînement sur les données anonymisées
+          - name: train
+            template: train-step
+            dependencies: [anonymize]
+
+          # Étape 3 : évaluation + promotion MLflow conditionnelle
+          - name: evaluate
+            template: eval-step
+            dependencies: [train]
+            arguments:
+              parameters:
+                - name: run-id
+                  value: "{{tasks.train.outputs.parameters.run-id}}"
+
+          # Étape 4 : mise à jour des images dans le Deployment serving
+          - name: deploy
+            template: deploy-step
+            dependencies: [evaluate]
+            when: "{{tasks.evaluate.status}} == Succeeded"
+
+    # -------------------------------------------------------------------------
+    # Step 1 — Anonymisation PII
+    # -------------------------------------------------------------------------
+    - name: anonymize-step
+      container:
+        image: "{{workflow.parameters.image-model}}"
+        imagePullPolicy: IfNotPresent
+        command:
+          - python
+          - -m
+          - core.data.utils.anonymization
+          - --input
+          - "{{workflow.parameters.data-raw-path}}"
+          - --output
+          - "{{workflow.parameters.data-anon-path}}"
+        env:
+          - name: ANON_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: anonymization-secret
+                key: secret-key
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+        volumeMounts:
+          - name: data-volume
+            mountPath: /data
+
+    # -------------------------------------------------------------------------
+    # Step 2 — Entraînement
+    # -------------------------------------------------------------------------
+    - name: train-step
+      outputs:
+        parameters:
+          - name: run-id
+            valueFrom:
+              path: /tmp/run_id.txt
+      container:
+        image: "{{workflow.parameters.image-model}}"
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-m", "core.model.train"]
+        env:
+          - name: DATA_PATH
+            value: "{{workflow.parameters.data-anon-path}}"
+          - name: MLFLOW_TRACKING_URI
+            value: http://mlflow:5000
+          - name: MODEL_NAME
+            value: "{{workflow.parameters.model-name}}"
+          - name: RUN_ID_OUTPUT_PATH
+            value: /tmp/run_id.txt
+          - name: GIT_COMMIT_SHA
+            value: "{{workflow.parameters.commit-sha}}"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "2"
+          limits:
+            memory: "4Gi"
+            cpu: "4"
+        volumeMounts:
+          - name: data-volume
+            mountPath: /data
+
+    # -------------------------------------------------------------------------
+    # Step 3 — Évaluation + promotion
+    # -------------------------------------------------------------------------
+    - name: eval-step
+      inputs:
+        parameters:
+          - name: run-id
+      container:
+        image: "{{workflow.parameters.image-model}}"
+        imagePullPolicy: IfNotPresent
+        command: ["python", "-m", "core.model.eval"]
+        env:
+          - name: DATA_PATH
+            value: "{{workflow.parameters.data-anon-path}}"
+          - name: MLFLOW_TRACKING_URI
+            value: http://mlflow:5000
+          - name: MODEL_NAME
+            value: "{{workflow.parameters.model-name}}"
+          - name: RUN_ID
+            value: "{{inputs.parameters.run-id}}"
+          - name: F1_PROMOTION_THRESHOLD
+            value: "{{workflow.parameters.f1-promotion-threshold}}"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "1"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+        volumeMounts:
+          - name: data-volume
+            mountPath: /data
+
+    # -------------------------------------------------------------------------
+    # Step 4 — Deploy : mise à jour des images + rolling restart
+    # -------------------------------------------------------------------------
+    - name: deploy-step
+      resource:
+        action: patch
+        mergeStrategy: merge
+        manifest: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: fraud-serving
+            namespace: fraud-detect
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{workflow.creationTimestamp}}"
+                  fraud-detect/commit-sha: "{{workflow.parameters.commit-sha}}"
+              spec:
+                containers:
+                  - name: fraud-serving
+                    image: "{{workflow.parameters.image-serving}}"
+
+  volumes:
+    - name: data-volume
+      persistentVolumeClaim:
+        claimName: fraud-data-pvc
+---
+# Secret pour la clé d'anonymisation
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anonymization-secret
+  namespace: fraud-detect
+type: Opaque
+stringData:
+  secret-key: changeme   # À remplacer — doit correspondre à ANON_SECRET_KEY

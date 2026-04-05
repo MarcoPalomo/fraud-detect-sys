@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-consumer
+  namespace: fraud-detect
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fraud-consumer
+  template:
+    metadata:
+      labels:
+        app: fraud-consumer
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      containers:
+        - name: fraud-consumer
+          image: fraud-detect/serving:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "core.data.kafka.consumer"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: fraud-kafka-kafka-bootstrap:9092
+            - name: KAFKA_TOPIC_INPUT
+              value: fraud-transactions
+            - name: KAFKA_TOPIC_ALERTS
+              value: fraud-alerts
+            - name: KAFKA_GROUP_ID
+              value: fraud-consumer-group
+            - name: SERVING_API_URL
+              value: http://fraud-serving:8000
+            - name: ALERT_THRESHOLD
+              value: "0.7"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4317
+            - name: OTEL_SERVICE_NAME
+              value: fraud-consumer
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 30
+            periodSeconds: 60

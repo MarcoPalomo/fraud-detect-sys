@@ -1,1 +1,28 @@
-# KafkaTopic CR — topic fraud-transactions
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fraud-transactions
+  namespace: fraud-detect
+  labels:
+    strimzi.io/cluster: fraud-kafka
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: "604800000"     # 7 jours
+    segment.bytes: "104857600"    # 100 MB par segment
+    cleanup.policy: delete
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: fraud-alerts
+  namespace: fraud-detect
+  labels:
+    strimzi.io/cluster: fraud-kafka
+spec:
+  partitions: 1
+  replicas: 1
+  config:
+    retention.ms: "2592000000"    # 30 jours (alertes conservées plus longtemps)
+    cleanup.policy: delete

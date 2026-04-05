@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.pem
+*.key
+# Ne jamais committer les secrets K8s en clair
+k8s/pgvector/secret.yaml
+mlruns/
+.DS_Store

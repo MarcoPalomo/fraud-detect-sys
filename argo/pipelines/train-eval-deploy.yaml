@@ -1,0 +1,1 @@
+# WorkflowTemplate Argo : train → evaluate → deploy conditionnel sur F1-score MLflow

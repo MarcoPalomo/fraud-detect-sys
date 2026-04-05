@@ -183,13 +183,5 @@ spec:
     - name: data-volume
       persistentVolumeClaim:
         claimName: fraud-data-pvc
----
-# Secret pour la clé d'anonymisation
-apiVersion: v1
-kind: Secret
-metadata:
-  name: anonymization-secret
-  namespace: fraud-detect
-type: Opaque
-stringData:
-  secret-key: changeme   # À remplacer — doit correspondre à ANON_SECRET_KEY
+# Le secret anonymization-secret est créé par : make secrets
+# Source : variable ANON_SECRET_KEY dans .env
